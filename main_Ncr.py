@@ -2359,3 +2359,5 @@ if st.sidebar.button("All_Report", key="All_Report"):
         )
     else:
         st.error("Please fetch data first!")
+        
+        
