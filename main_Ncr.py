@@ -326,7 +326,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None, Until_D
                 '  }\n'
                 '}\n\n'
                 f"Data: {json.dumps(chunk)}\n"
-                "Return the result as a single JSON object with only the specified fields."
+                "Return the result as a single JSON object with only the specified fields, no need any explanation, need only JSON loads."
             )
 
             payload = {
