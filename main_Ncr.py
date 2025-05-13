@@ -153,31 +153,51 @@ def process_json_data(json_data):
     return df
 
 # Generate NCR Report
-
 @st.cache_data
-def generate_ncr_report(df, report_type, start_date=None, end_date=None):
+def generate_ncr_report(df, report_type, start_date=None, end_date=None, Until_Date=None):
     with st.spinner(f"Generating {report_type} NCR Report..."):
-        # Filter based on Created Date (WET) range and pre-calculated Days > 20
+        # Ensure the DataFrame has no NaT values in critical columns for filtering
+        df = df.copy()
+        df = df[df['Created Date (WET)'].notna()]  # Drop rows where 'Created Date (WET)' is NaT
+        
         if report_type == "Closed":
+            # Convert start_date and end_date to datetime
+            try:
+                start_date = pd.to_datetime(start_date) if start_date else df['Created Date (WET)'].min()
+                end_date = pd.to_datetime(end_date) if end_date else df['Expected Close Date (WET)'].max()
+            except ValueError as e:
+                logger.error(f"Invalid date range: {str(e)}")
+                st.error(f"❌ Invalid date range: {str(e)}")
+                return {"error": "Invalid date range"}, ""
+
+            # Drop rows where 'Expected Close Date (WET)' is NaT for Closed report
+            df = df[df['Expected Close Date (WET)'].notna()]
+            
             filtered_df = df[
                 (df['Status'] == 'Closed') &
-                (df['Created Date (WET)'] >= pd.to_datetime(start_date)) &
-                (df['Expected Close Date (WET)'] <= pd.to_datetime(end_date)) &
+                (df['Created Date (WET)'] >= start_date) &
+                (df['Expected Close Date (WET)'] <= end_date) &
                 (df['Days'] > 21)
             ].copy()
-        else:  # Open
-            today = pd.to_datetime(datetime.today().strftime('%Y/%m/%d'))  # Updated to use current date
+        else:  # Open report
+            if Until_Date is None:
+                logger.error("Open Until Date is required for Open NCR Report")
+                st.error("❌ Open Until Date is required for Open NCR Report")
+                return {"error": "Open Until Date is required"}, ""
+            
+            try:
+                today = pd.to_datetime(Until_Date)
+            except ValueError as e:
+                logger.error(f"Invalid Open Until Date: {str(e)}")
+                st.error(f"❌ Invalid Open Until Date: {str(e)}")
+                return {"error": "Invalid Open Until Date"}, ""
+                
             filtered_df = df[
                 (df['Status'] == 'Open') &
                 (df['Created Date (WET)'].notna())
             ].copy()
             filtered_df.loc[:, 'Days_From_Today'] = (today - pd.to_datetime(filtered_df['Created Date (WET)'])).dt.days
             filtered_df = filtered_df[filtered_df['Days_From_Today'] > 21].copy()
-
-        # Exclude records where Discipline is "None" (case-insensitive and handle NaN)
-        filtered_df = filtered_df[
-            filtered_df['Discipline'].fillna('').str.lower() != 'none'
-        ].copy()
 
         if filtered_df.empty:
             return {"error": f"No {report_type} records found with duration > 20 days"}, ""
@@ -186,6 +206,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
         filtered_df.loc[:, 'Expected Close Date (WET)'] = filtered_df['Expected Close Date (WET)'].astype(str)
 
         processed_data = filtered_df.to_dict(orient="records")
+        
         
         cleaned_data = []
         for record in processed_data:
@@ -262,6 +283,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
             local_result[report_type]["Sites"][tower]["Total"] += 1
             local_result[report_type]["Grand_Total"] += 1
 
+
         chunk_size = 50
         all_results = {report_type: {"Sites": {}, "Grand_Total": 0}}
 
@@ -281,8 +303,8 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                 f"Finally, calculate the 'Grand_Total' as the total number of records processed.\n"
                 f"Condition: Only include records where:\n"
                 f"- Status is '{report_type}'.\n"
-                f"- For report_type == 'Closed': Days > 21 (pre-calculated planned duration).\n"
-                f"- For report_type == 'Open': Days_From_Today > 21 (already calculated in the data).\n"
+                f"- For report_type == 'Closed': Days > 20 (pre-calculated planned duration).\n"
+                f"- For report_type == 'Open': Days_From_Today > 20 (already calculated in the data).\n"
                 "Use 'Tower' values (e.g., 'Veridia-Tower-04', 'Common_Area') and 'Discipline_Category' values (e.g., 'SW', 'FW', 'MEP') exactly as provided. Count each record exactly once.\n\n"
                 "REQUIRED OUTPUT FORMAT (ONLY THESE FIELDS):\n"
                 "{\n"
@@ -304,9 +326,8 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                 '  }\n'
                 '}\n\n'
                 f"Data: {json.dumps(chunk)}\n"
-                "Return the result as a single JSON object with only the specified fields, no need any explanation, need only JSON loads."
+                "Return the result as a single JSON object with only the specified fields."
             )
-               
 
             payload = {
                 "input": prompt,
@@ -358,7 +379,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                         "Created Date (WET)": [],
                                         "Expected Close Date (WET)": [],
                                         "Status": [],
-                                        "Discipline": [],
+                                        "Discipline": [],  # Add Discipline array
                                         "SW": 0,
                                         "FW": 0,
                                         "MEP": 0,
@@ -368,7 +389,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                 all_results[report_type]["Sites"][site]["Created Date (WET)"].extend(data["Created Date (WET)"])
                                 all_results[report_type]["Sites"][site]["Expected Close Date (WET)"].extend(data["Expected Close Date (WET)"])
                                 all_results[report_type]["Sites"][site]["Status"].extend(data["Status"])
-                                all_results[report_type]["Sites"][site]["Discipline"].extend(data["Discipline"])
+                                all_results[report_type]["Sites"][site]["Discipline"].extend(data["Discipline"])  # Add Discipline from API
                                 all_results[report_type]["Sites"][site]["SW"] += data["SW"]
                                 all_results[report_type]["Sites"][site]["FW"] += data["FW"]
                                 all_results[report_type]["Sites"][site]["MEP"] += data["MEP"]
@@ -387,7 +408,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                         "Created Date (WET)": [],
                                         "Expected Close Date (WET)": [],
                                         "Status": [],
-                                        "Discipline": [],
+                                        "Discipline": [],  # Add Discipline array
                                         "SW": 0,
                                         "FW": 0,
                                         "MEP": 0,
@@ -397,7 +418,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                 all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                                 all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                                 all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
-                                all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
+                                all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])  # Add Discipline
                                 all_results[report_type]["Sites"][tower][discipline] += 1
                                 all_results[report_type]["Sites"][tower]["Total"] += 1
                                 all_results[report_type]["Grand_Total"] += 1
@@ -414,7 +435,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                     "Created Date (WET)": [],
                                     "Expected Close Date (WET)": [],
                                     "Status": [],
-                                    "Discipline": [],
+                                    "Discipline": [],  # Add Discipline array
                                     "SW": 0,
                                     "FW": 0,
                                     "MEP": 0,
@@ -424,7 +445,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                             all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                             all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                             all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
-                            all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
+                            all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])  # Add Discipline
                             all_results[report_type]["Sites"][tower][discipline] += 1
                             all_results[report_type]["Sites"][tower]["Total"] += 1
                             all_results[report_type]["Grand_Total"] += 1
@@ -442,7 +463,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                                 "Created Date (WET)": [],
                                 "Expected Close Date (WET)": [],
                                 "Status": [],
-                                "Discipline": [],
+                                "Discipline": [],  # Add Discipline array
                                 "SW": 0,
                                 "FW": 0,
                                 "MEP": 0,
@@ -452,7 +473,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                         all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                         all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                         all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
-                        all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
+                        all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])  # Add Discipline
                         all_results[report_type]["Sites"][tower][discipline] += 1
                         all_results[report_type]["Sites"][tower]["Total"] += 1
                         all_results[report_type]["Grand_Total"] += 1
@@ -471,7 +492,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                             "Created Date (WET)": [],
                             "Expected Close Date (WET)": [],
                             "Status": [],
-                            "Discipline": [],
+                            "Discipline": [],  # Add Discipline array
                             "SW": 0,
                             "FW": 0,
                             "MEP": 0,
@@ -481,7 +502,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                     all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                     all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                     all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
-                    all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
+                    all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])  # Add Discipline
                     all_results[report_type]["Sites"][tower][discipline] += 1
                     all_results[report_type]["Sites"][tower]["Total"] += 1
                     all_results[report_type]["Grand_Total"] += 1
@@ -500,7 +521,7 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                         "Created Date (WET)": [],
                         "Expected Close Date (WET)": [],
                         "Status": [],
-                        "Discipline": [],
+                        "Discipline": [],  # Add Discipline array
                         "SW": 0,
                         "FW": 0,
                         "MEP": 0,
@@ -510,41 +531,14 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                 all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                 all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                 all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
-                all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
+                all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])  # Add Discipline
                 all_results[report_type]["Sites"][tower][discipline] += 1
                 all_results[report_type]["Sites"][tower]["Total"] += 1
                 all_results[report_type]["Grand_Total"] += 1
 
         st.write(f"Debug - Final {report_type} result: {json.dumps(all_results, indent=2)}")
         return all_results, json.dumps(all_results)
-
-def clean_and_parse_json(generated_text):
-    # Remove code block markers if present
-    cleaned_text = re.sub(r'```json|```python|```', '', generated_text).strip()
     
-    # First attempt: Try to parse the text directly as JSON
-    try:
-        for line in cleaned_text.split('\n'):
-            line = line.strip()
-            if line.startswith('{') and line.endswith('}'):
-                return json.loads(line)
-        return json.loads(cleaned_text)
-    except json.JSONDecodeError as e:
-        logger.warning(f"Initial JSONDecodeError: {str(e)} - Cleaned response: {cleaned_text}")
-    
-    # Second attempt: If the response contains Python code with a print(json.dumps(...)),
-    # extract the JSON from the output
-    json_match = re.search(r'print$$ json\.dumps\((.*?),\s*indent=2 $$\)', cleaned_text, re.DOTALL)
-    if json_match:
-        json_str = json_match.group(1).strip()
-        try:
-            return eval(json_str)  # Safely evaluate the JSON string as a Python dict
-        except Exception as e:
-            logger.error(f"Failed to evaluate extracted JSON: {str(e)} - Extracted JSON: {json_str}")
-    
-    logger.error(f"JSONDecodeError: Unable to parse response - Cleaned response: {cleaned_text}")
-    return None
-
 @st.cache_data
 def generate_ncr_Housekeeping_report(df, report_type, start_date=None, end_date=None, open_until_date=None):
     with st.spinner(f"Generating {report_type} Housekeeping NCR Report with WatsonX..."):
@@ -950,6 +944,33 @@ def generate_ncr_Housekeeping_report(df, report_type, start_date=None, end_date=
         
         logger.debug(f"Final result after deduplication: {json.dumps(result, indent=2)}")
         return result, json.dumps(result)
+
+def clean_and_parse_json(generated_text):
+    # Remove code block markers if present
+    cleaned_text = re.sub(r'```json|```python|```', '', generated_text).strip()
+    
+    # First attempt: Try to parse the text directly as JSON
+    try:
+        for line in cleaned_text.split('\n'):
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                return json.loads(line)
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError as e:
+        logger.warning(f"Initial JSONDecodeError: {str(e)} - Cleaned response: {cleaned_text}")
+    
+    # Second attempt: If the response contains Python code with a print(json.dumps(...)),
+    # extract the JSON from the output
+    json_match = re.search(r'print$$ json\.dumps\((.*?),\s*indent=2 $$\)', cleaned_text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1).strip()
+        try:
+            return eval(json_str)  # Safely evaluate the JSON string as a Python dict
+        except Exception as e:
+            logger.error(f"Failed to evaluate extracted JSON: {str(e)} - Extracted JSON: {json_str}")
+    
+    logger.error(f"JSONDecodeError: Unable to parse response - Cleaned response: {cleaned_text}")
+    return None
     
 
 @st.cache_data
@@ -2104,22 +2125,13 @@ if "session_id" in st.session_state:
 st.sidebar.title("📋 Combined NCR Report")
 if st.session_state["ncr_df"] is not None:
     ncr_df = st.session_state["ncr_df"]
-    closed_start = st.sidebar.date_input("Closed Start Date", ncr_df['Expected Close Date (WET)'].min(), key="ncr_closed_start")
-    closed_end = st.sidebar.date_input("Closed End Date", ncr_df['Expected Close Date (WET)'].max(), key="ncr_closed_end")
-    open_end = st.sidebar.date_input("Open Until Date", ncr_df['Expected Close Date (WET)'].max(), key="ncr_open_end")
+    closed_start = st.sidebar.date_input("Closed Start Date", ncr_df['Created Date (WET)'].min().date(), key="ncr_closed_start")
+    closed_end = st.sidebar.date_input("Closed End Date", ncr_df['Expected Close Date (WET)'].max().date(), key="ncr_closed_end")
+    open_end = st.sidebar.date_input("Open Until Date", ncr_df['Created Date (WET)'].max().date(), key="ncr_open_end")
 else:
     closed_start = st.sidebar.date_input("Closed Start Date", key="ncr_closed_start")
     closed_end = st.sidebar.date_input("Closed End Date", key="ncr_closed_end")
     open_end = st.sidebar.date_input("Open Until Date", key="ncr_open_end")
-
-
-# Helper function to generate report title
-def generate_report_title(prefix):
-    now = datetime.now()  # Current date: April 25, 2025
-    day = now.strftime("%d")
-    month_name = now.strftime("%B")
-    year = now.strftime("%Y")
-    return f"{prefix}: {day}_{month_name}_{year}"
 
 # Generate Combined NCR Report
 if st.sidebar.button("NCR(Open&Close) Report", key="generate_report_button"):
@@ -2132,7 +2144,7 @@ if st.sidebar.button("NCR(Open&Close) Report", key="generate_report_button"):
         report_title = f"NCR: {day}_{month_name}_{year}"
         
         closed_result, closed_raw = generate_ncr_report(ncr_df, "Closed", closed_start, closed_end)
-        open_result, open_raw = generate_ncr_report(ncr_df, "Open", open_end)
+        open_result, open_raw = generate_ncr_report(ncr_df, "Open", Until_Date=open_end)
 
         combined_result = {}
         if "error" not in closed_result:
@@ -2156,6 +2168,14 @@ if st.sidebar.button("NCR(Open&Close) Report", key="generate_report_button"):
         )
     else:
         st.error("Please fetch data first!")
+
+# Helper function to generate report title
+def generate_report_title(prefix):
+    now = datetime.now()  # Current date: April 25, 2025
+    day = now.strftime("%d")
+    month_name = now.strftime("%B")
+    year = now.strftime("%Y")
+    return f"{prefix}: {day}_{month_name}_{year}"
 
 # Generate Safety NCR Report
 if st.sidebar.button("Safety NCR Report", key="safety_ncr"):
