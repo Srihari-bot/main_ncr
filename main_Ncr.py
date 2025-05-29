@@ -188,19 +188,16 @@ def clean_and_parse_json(text):
     return None
 
 # NCR_Open_Closed
+
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(Exception))
 def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end_date=None, Until_Date=None) -> Tuple[Dict[str, Any], str]:
     with st.spinner(f"Generating {report_type} NCR Report..."):
-        # Step 1: Input validation and logging
+        # Ensure the DataFrame has no NaT values in critical columns for filtering
         df = df.copy()
-        df = df[df['Created Date (WET)'].notna()]  # Drop rows with NaT in 'Created Date (WET)'
+        df = df[df['Created Date (WET)'].notna()]  # Drop rows where 'Created Date (WET)' is NaT
         
-        # Log and exclude records with Days == 21 or Days_From_Today == 21
         if report_type == "Closed":
-            invalid_records = df[df['Days'] == 21]
-            if not invalid_records.empty:
-                logger.warning(f"Found {len(invalid_records)} Closed records with Days > 21: {invalid_records[['Description', 'Days']].to_dict('records')}")
-                df = df[df['Days'] > 21]
+            # Convert start_date and end_date to datetime
             try:
                 start_date = pd.to_datetime(start_date) if start_date else df['Created Date (WET)'].min()
                 end_date = pd.to_datetime(end_date) if end_date else df['Expected Close Date (WET)'].max()
@@ -208,7 +205,10 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 logger.error(f"Invalid date range: {str(e)}")
                 st.error(f"❌ Invalid date range: {str(e)}")
                 return {"error": "Invalid date range"}, ""
+
+            # Drop rows where 'Expected Close Date (WET)' is NaT for Closed report
             df = df[df['Expected Close Date (WET)'].notna()]
+            
             filtered_df = df[
                 (df['Status'] == 'Closed') &
                 (df['Created Date (WET)'] >= start_date) &
@@ -220,37 +220,33 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 logger.error("Open Until Date is required for Open NCR Report")
                 st.error("❌ Open Until Date is required for Open NCR Report")
                 return {"error": "Open Until Date is required"}, ""
+            
             try:
                 today = pd.to_datetime(Until_Date)
             except ValueError as e:
                 logger.error(f"Invalid Open Until Date: {str(e)}")
                 st.error(f"❌ Invalid Open Until Date: {str(e)}")
                 return {"error": "Invalid Open Until Date"}, ""
+                
             filtered_df = df[
                 (df['Status'] == 'Open') &
                 (df['Created Date (WET)'].notna())
             ].copy()
             filtered_df.loc[:, 'Days_From_Today'] = (today - pd.to_datetime(filtered_df['Created Date (WET)'])).dt.days
-            invalid_records = filtered_df[filtered_df['Days_From_Today'] == 21]
-            if not invalid_records.empty:
-                logger.warning(f"Found {len(invalid_records)} Open records with Days_From_Today == 21: {invalid_records[['Description', 'Days_From_Today']].to_dict('records')}")
-                filtered_df = filtered_df[filtered_df['Days_From_Today'] > 21].copy()
+            filtered_df = filtered_df[filtered_df['Days_From_Today'] > 21].copy()
 
         if filtered_df.empty:
-            logger.info(f"No {report_type} records found with duration > 21 days")
             return {"error": f"No {report_type} records found with duration > 21 days"}, ""
 
-        # Step 2: Preprocess data and ensure no == 21 records
         filtered_df.loc[:, 'Created Date (WET)'] = filtered_df['Created Date (WET)'].astype(str)
         filtered_df.loc[:, 'Expected Close Date (WET)'] = filtered_df['Expected Close Date (WET)'].astype(str)
-        processed_data = filtered_df.to_dict(orient="records")
 
+        processed_data = filtered_df.to_dict(orient="records")
+        
         cleaned_data = []
+        unique_records = []  # To track unique records for Grand_Total
+
         for record in processed_data:
-            if (report_type == "Closed" and record.get("Days", 0) <= 21) or \
-               (report_type == "Open" and record.get("Days_From_Today", 0) <= 21):
-                logger.warning(f"Unexpected record with invalid duration found: {record}")
-                continue
             cleaned_record = {
                 "Description": str(record.get("Description", "")),
                 "Discipline": str(record.get("Discipline", "")),
@@ -264,6 +260,8 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 cleaned_record["Days_From_Today"] = int(record.get("Days_From_Today", 0))
 
             description = cleaned_record["Description"].lower()
+            
+            # Initialize Discipline_Category
             discipline = cleaned_record["Discipline"].strip().lower()
             if discipline == "none":
                 logger.debug(f"Skipping record with invalid discipline: {discipline}")
@@ -274,86 +272,111 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 cleaned_record["Discipline_Category"] = "FW"
             else:
                 cleaned_record["Discipline_Category"] = "MEP"
+                
+            unique_records.append(cleaned_record["Description"])  # Track unique descriptions
+
+            # Tower categorization
+            # Replace the existing tower categorization logic with this corrected version
 
             # Tower categorization
             if any(phrase in description for phrase in ["veridia clubhouse", "veridia-clubhouse", "veridia club"]):
                 cleaned_record["Tower"] = "Veridia-Club"
+                logger.debug(f"Matched 'Veridia Clubhouse' in description: {description}")
                 cleaned_data.append(cleaned_record)
             else:
+                # Extract all towers - This regex will find all tower numbers
                 tower_matches = re.findall(r"(tower|t)\s*-?\s*(\d+)", description, re.IGNORECASE)
+                
+                # Check for multiple tower patterns like "Tower- 4&7", "T-4&T-7", etc.
                 multiple_tower_pattern = re.search(
                     r"(tower|t)\s*-?\s*(\d+)\s*([,&]|and)\s*(tower|t)?\s*-?\s*(\d+)",
                     description,
                     re.IGNORECASE
                 )
+                
                 flat_no_pattern = re.search(r"flat\s*no", description, re.IGNORECASE)
                 
                 if multiple_tower_pattern:
-                    tower1 = multiple_tower_pattern.group(2).zfill(2)
-                    tower2 = multiple_tower_pattern.group(5).zfill(2)
+                    # Extract the two tower numbers from the multiple tower pattern
+                    match = multiple_tower_pattern
+                    tower1 = match.group(2).zfill(2)  # First tower number
+                    tower2 = match.group(5).zfill(2)  # Second tower number
+                    
+                    # Create a record for each tower's common area
                     for tower_num in [tower1, tower2]:
                         tower_record = cleaned_record.copy()
                         tower_record["Tower"] = f"Veridia-Tower-{tower_num}-CommonArea"
                         cleaned_data.append(tower_record)
+                        logger.debug(f"Added common area record for Veridia-Tower-{tower_num}-CommonArea: {description}")
                 elif flat_no_pattern and tower_matches:
-                    tower_num = tower_matches[0][1].zfill(2)
+                    # Assign to the specific tower (without CommonArea suffix for flat numbers)
+                    tower_num = tower_matches[0][1].zfill(2)  # Use the first tower mentioned
                     cleaned_record["Tower"] = f"Veridia-Tower-{tower_num}"
                     cleaned_data.append(cleaned_record)
+                    logger.debug(f"Assigned Veridia-Tower-{tower_num} for Flat no description: {description}")
                 elif "common area" in description or not tower_matches:
                     cleaned_record["Tower"] = "Common_Area"
                     cleaned_data.append(cleaned_record)
+                    logger.debug(f"Assigned Common_Area: {description}")
                 else:
+                    # Single tower case
                     tower_num = tower_matches[0][1].zfill(2)
                     cleaned_record["Tower"] = f"Veridia-Tower-{tower_num}"
+                    logger.debug(f"Single tower match: Veridia-Tower-{tower_num}")
                     cleaned_data.append(cleaned_record)
-
-        # Deduplicate records
+        # Deduplicate dictionaries
         cleaned_data = [dict(t) for t in {tuple(sorted(d.items())) for d in cleaned_data}]
+
         if not cleaned_data:
-            logger.info(f"No valid records after preprocessing for {report_type}")
             return {report_type: {"Sites": {}, "Grand_Total": 0}}, ""
 
-        # Step 3: WatsonX API call
         access_token = get_access_token(API_KEY)
         if not access_token:
-            logger.error("Failed to obtain access token")
             return {"error": "Failed to obtain access token"}, ""
+
+        # Local count for validation (without Modules)
+        local_result = {report_type: {"Sites": {}, "Grand_Total": 0}}
+        for record in cleaned_data:
+            tower = record["Tower"]
+            discipline = record["Discipline_Category"]
+            if tower not in local_result[report_type]["Sites"]:
+                local_result[report_type]["Sites"][tower] = {
+                    "SW": 0,
+                    "FW": 0,
+                    "MEP": 0,
+                    "Total": 0
+                }
+            local_result[report_type]["Sites"][tower][discipline] += 1
+            local_result[report_type]["Sites"][tower]["Total"] += 1
+            local_result[report_type]["Grand_Total"] += 1
 
         chunk_size = 3
         all_results = {report_type: {"Sites": {}, "Grand_Total": 0}}
 
         for i in range(0, len(cleaned_data), chunk_size):
+            
             chunk = cleaned_data[i:i + chunk_size]
-            # Double-check chunk for == 21 records
-            invalid_chunk_records = [r for r in chunk if (report_type == "Closed" and r.get("Days", 0) <= 21) or
-                                                    (report_type == "Open" and r.get("Days_From_Today", 0) <= 21)]
-            if invalid_chunk_records:
-                logger.warning(f"Found {len(invalid_chunk_records)} invalid records in chunk {i // chunk_size + 1}: {invalid_chunk_records}")
-                chunk = [r for r in chunk if (report_type == "Closed" and r.get("Days", 0) > 21) or
-                                            (report_type == "Open" and r.get("Days_From_Today", 0) > 21)]
-                if not chunk:
-                    logger.info(f"Chunk {i // chunk_size + 1} is empty after filtering invalid records")
-                    continue
-
             st.write(f"Processing chunk {i // chunk_size + 1}: Records {i} to {min(i + chunk_size, len(cleaned_data))}")
-            logger.info(f"Data sent to WatsonX: {json.dumps(chunk, indent=2)}")
+            logger.info(f"Data sent to WatsonX for {report_type} chunk {i // chunk_size + 1}: {json.dumps(chunk, indent=2)}")
 
             prompt = (
                 "IMPORTANT: RETURN ONLY A SINGLE VALID JSON OBJECT WITH THE EXACT FIELDS SPECIFIED BELOW. "
-                "DO NOT GENERATE ANY CODE. DO NOT INCLUDE ANY TEXT, EXPLANATIONS, OR MULTIPLE RESPONSES OUTSIDE THE JSON OBJECT. "
+                "DO NOT GENERATE ANY CODE (e.g., Python, JavaScript). "
+                "DO NOT INCLUDE ANY TEXT, EXPLANATIONS, OR MULTIPLE RESPONSES OUTSIDE THE JSON OBJECT. "
+                "DO NOT WRAP THE JSON IN CODE BLOCKS (e.g., ```json). "
                 "RETURN THE JSON OBJECT DIRECTLY.\n\n"
-                f"Task: Group records by 'Tower' and collect 'Description', 'Created Date (WET)', 'Expected Close Date (WET)', 'Status', and 'Discipline' into arrays. "
-                f"Extract modules from 'Description' (e.g., 'M1', 'M2', 'Common') from patterns like 'Module- 1', 'Module- 3 & 4', 'M-1', 'Module 1 to 3'. "
-                f"For ranges (e.g., 'Module 1 to 3'), include all modules (e.g., ['M1', 'M2', 'M3']). For lists (e.g., 'Module- 3&4'), include each module (e.g., ['M3', 'M4']). "
-                f"If no modules are specified, or 'common area'/'Flat no'/'multiple towers' are mentioned, use ['Common']. "
-                f"Count records by 'Discipline_Category' ('SW', 'FW', 'MEP'), calculate 'Total' per 'Tower', and count module occurrences in 'ModulesCount'. "
-                f"Calculate 'Grand_Total' as the total number of valid records.\n"
-                f"Condition: ONLY include records where:\n"
+                f"Task: For each record in the provided data, group by 'Tower' and collect 'Description', 'Created Date (WET)', 'Expected Close Date (WET)', 'Status', and 'Discipline' into arrays. "
+                f"Extract modules from the 'Description' field for each record. Modules are identifiers like 'M1', 'M2', 'Common', etc., found in patterns such as 'Module- 1', 'Module- 3 & 4', 'M-1', 'Module1', 'Module 1 to 3', or 'Common' for common areas. "
+                f"For module ranges (e.g., 'Module 1 to 3'), include all modules in the range (e.g., ['M1', 'M2', 'M3']). For lists or pairs (e.g., 'Module- 3 & 4', 'Module- 3&4', 'Module- 1&2', 'M-1', 'Module-1,2'), include each module (e.g., ['M3', 'M4'], ['M1', 'M2']). "
+                f"If no modules are specified, the description mentions 'common area', contains 'Flat no' (e.g., 'Flat no - 114, 213'), or matches multiple towers (e.g., 'Tower- 4&7'), use ['Common']. "
+                f"Count the records by 'Discipline_Category' ('SW', 'FW', 'MEP'), calculate the 'Total' for each 'Tower', and count occurrences of each module within 'Modules' (e.g., M5, M6) within each 'Tower'. "
+                f"Finally, calculate the 'Grand_Total' as the total number of records processed.\n"
+                f"Condition: Only include records where:\n"
                 f"- Status is '{report_type}'.\n"
-                f"- For report_type == 'Closed': Days > 21. EXCLUDE Days == 21.\n"
-                f"- For report_type == 'Open': Days_From_Today > 21. EXCLUDE Days_From_Today == 21.\n"
-                f"Use 'Tower' values (e.g., 'Veridia-Tower-04-CommonArea'), 'Discipline_Category' ('SW', 'FW', 'MEP'), and extracted 'Modules'. Count each record once.\n\n"
-                "REQUIRED OUTPUT FORMAT:\n"
+                f"- For report_type == 'Closed': Days > 21 (pre-calculated planned duration).\n"
+                f"- For report_type == 'Open': Days_From_Today > 21 (already calculated in the data).\n"
+                f"Use 'Tower' values (e.g., 'Veridia-Tower-04-CommonArea', 'Veridia-Tower-07-CommonArea', 'Common_Area'), 'Discipline_Category' values (e.g., 'SW', 'FW', 'MEP'), and extracted 'Modules' values. Count each record exactly once.\n\n"
+                "REQUIRED OUTPUT FORMAT (ONLY THESE FIELDS):\n"
                 "{\n"
                 f'  "{report_type}": {{\n'
                 '    "Sites": {\n'
@@ -375,7 +398,7 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 '  }\n'
                 '}\n\n'
                 f"Data: {json.dumps(chunk)}\n"
-                f"Return the result as a single JSON object."
+                f"Return the result as a single JSON object with only the specified fields."
             )
 
             payload = {
@@ -395,6 +418,7 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 "Authorization": f"Bearer {access_token}"
             }
 
+            # Retry logic for the WatsonX API call
             retry_strategy = Retry(
                 total=3,
                 backoff_factor=1,
@@ -413,19 +437,30 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                 if response.status_code == 200:
                     api_result = response.json()
                     generated_text = api_result.get("results", [{}])[0].get("generated_text", "").strip()
+                    short_text = generated_text[:200] + "..." if len(generated_text) > 200 else generated_text
+                    st.write(f"Debug - Raw response preview: {short_text}")
+                    logger.debug(f"Parsed generated text: {generated_text}")
+
                     parsed_json = clean_and_parse_json(generated_text)
                     if parsed_json and report_type in parsed_json:
                         chunk_result = parsed_json[report_type]
                         chunk_grand_total = chunk_result.get("Grand_Total", 0)
-                        expected_total = len([r for r in chunk if (report_type == "Closed" and r.get("Days", 0) > 21) or
-                                                             (report_type == "Open" and r.get("Days_From_Today", 0) > 21)])
+                        expected_total = len(chunk)
                         if chunk_grand_total == expected_total:
                             for site, data in chunk_result["Sites"].items():
                                 if site not in all_results[report_type]["Sites"]:
                                     all_results[report_type]["Sites"][site] = {
-                                        "Descriptions": [], "Created Date (WET)": [], "Expected Close Date (WET)": [],
-                                        "Status": [], "Discipline": [], "Modules": [],
-                                        "SW": 0, "FW": 0, "MEP": 0, "Total": 0, "ModulesCount": {}
+                                        "Descriptions": [],
+                                        "Created Date (WET)": [],
+                                        "Expected Close Date (WET)": [],
+                                        "Status": [],
+                                        "Discipline": [],
+                                        "Modules": [],
+                                        "SW": 0,
+                                        "FW": 0,
+                                        "MEP": 0,
+                                        "Total": 0,
+                                        "ModulesCount": {}
                                     }
                                 all_results[report_type]["Sites"][site]["Descriptions"].extend(data["Descriptions"])
                                 all_results[report_type]["Sites"][site]["Created Date (WET)"].extend(data["Created Date (WET)"])
@@ -438,121 +473,139 @@ def generate_ncr_report(df: pd.DataFrame, report_type: str, start_date=None, end
                                 all_results[report_type]["Sites"][site]["MEP"] += data["MEP"]
                                 all_results[report_type]["Sites"][site]["Total"] += data["Total"]
                                 for module, count in data["ModulesCount"].items():
-                                    all_results[report_type]["Sites"][site]["ModulesCount"][module] = \
-                                        all_results[report_type]["Sites"][site]["ModulesCount"].get(module, 0) + count
+                                    all_results[report_type]["Sites"][site]["ModulesCount"][module] = all_results[report_type]["Sites"][site]["ModulesCount"].get(module, 0) + count
                             all_results[report_type]["Grand_Total"] += chunk_grand_total
                             st.write(f"Successfully processed chunk {i // chunk_size + 1}")
                         else:
-                            logger.warning(f"API Grand_Total {chunk_grand_total} does not match expected {expected_total}")
-                            st.warning(f"API returned incorrect count, using local count")
+                            logger.warning(f"API Grand_Total {chunk_grand_total} does not match expected {expected_total}, falling back to local count")
+                            st.warning(f"API returned incorrect count (Grand_Total: {chunk_grand_total}, expected: {expected_total}), using local count")
                             for record in chunk:
-                                if (report_type == "Closed" and record.get("Days", 0) <= 21) or \
-                                   (report_type == "Open" and record.get("Days_From_Today", 0) <= 21):
-                                    logger.warning(f"Skipping invalid record in fallback: {record}")
-                                    continue
                                 tower = record["Tower"]
                                 discipline = record["Discipline_Category"]
                                 if tower not in all_results[report_type]["Sites"]:
                                     all_results[report_type]["Sites"][tower] = {
-                                        "Descriptions": [], "Created Date (WET)": [], "Expected Close Date (WET)": [],
-                                        "Status": [], "Discipline": [], "Modules": [],
-                                        "SW": 0, "FW": 0, "MEP": 0, "Total": 0, "ModulesCount": {}
+                                        "Descriptions": [],
+                                        "Created Date (WET)": [],
+                                        "Expected Close Date (WET)": [],
+                                        "Status": [],
+                                        "Discipline": [],
+                                        "Modules": [],
+                                        "SW": 0,
+                                        "FW": 0,
+                                        "MEP": 0,
+                                        "Total": 0,
+                                        "ModulesCount": {}
                                     }
                                 all_results[report_type]["Sites"][tower]["Descriptions"].append(record["Description"])
                                 all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                                 all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                                 all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
                                 all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
-                                all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])
+                                all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])  # Default for local fallback
                                 all_results[report_type]["Sites"][tower][discipline] += 1
                                 all_results[report_type]["Sites"][tower]["Total"] += 1
-                                all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = \
-                                    all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
+                                all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
                                 all_results[report_type]["Grand_Total"] += 1
                     else:
                         logger.error("No valid JSON found in response")
                         st.error("❌ No valid JSON found in response")
+                        st.write("Falling back to local count for this chunk")
                         for record in chunk:
-                            if (report_type == "Closed" and record.get("Days", 0) <= 21) or \
-                               (report_type == "Open" and record.get("Days_From_Today", 0) <= 21):
-                                logger.warning(f"Skipping invalid record in fallback: {record}")
-                                continue
                             tower = record["Tower"]
                             discipline = record["Discipline_Category"]
                             if tower not in all_results[report_type]["Sites"]:
                                 all_results[report_type]["Sites"][tower] = {
-                                    "Descriptions": [], "Created Date (WET)": [], "Expected Close Date (WET)": [],
-                                    "Status": [], "Discipline": [], "Modules": [],
-                                    "SW": 0, "FW": 0, "MEP": 0, "Total": 0, "ModulesCount": {}
+                                    "Descriptions": [],
+                                    "Created Date (WET)": [],
+                                    "Expected Close Date (WET)": [],
+                                    "Status": [],
+                                    "Discipline": [],
+                                    "Modules": [],
+                                    "SW": 0,
+                                    "FW": 0,
+                                    "MEP": 0,
+                                    "Total": 0,
+                                    "ModulesCount": {}
                                 }
                             all_results[report_type]["Sites"][tower]["Descriptions"].append(record["Description"])
                             all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                             all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                             all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
                             all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
-                            all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])
+                            all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])  # Default for local fallback
                             all_results[report_type]["Sites"][tower][discipline] += 1
                             all_results[report_type]["Sites"][tower]["Total"] += 1
-                            all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = \
-                                all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
+                            all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
                             all_results[report_type]["Grand_Total"] += 1
                 else:
-                    logger.error(f"WatsonX API error: {response.status_code} - {response.text}")
-                    st.error(f"❌ WatsonX API error: {response.status_code}")
+                    error_msg = f"❌ WatsonX API error: {response.status_code} - {response.text}"
+                    st.error(error_msg)
+                    logger.error(error_msg)
+                    st.write("Falling back to local count for this chunk")
                     for record in chunk:
-                        if (report_type == "Closed" and record.get("Days", 0) <= 21) or \
-                           (report_type == "Open" and record.get("Days_From_Today", 0) <= 21):
-                            logger.warning(f"Skipping invalid record in fallback: {record}")
-                            continue
                         tower = record["Tower"]
                         discipline = record["Discipline_Category"]
                         if tower not in all_results[report_type]["Sites"]:
                             all_results[report_type]["Sites"][tower] = {
-                                "Descriptions": [], "Created Date (WET)": [], "Expected Close Date (WET)": [],
-                                "Status": [], "Discipline": [], "Modules": [],
-                                "SW": 0, "FW": 0, "MEP": 0, "Total": 0, "ModulesCount": {}
+                                "Descriptions": [],
+                                "Created Date (WET)": [],
+                                "Expected Close Date (WET)": [],
+                                "Status": [],
+                                "Discipline": [],
+                                "Modules": [],
+                                "SW": 0,
+                                "FW": 0,
+                                "MEP": 0,
+                                "Total": 0,
+                                "ModulesCount": {}
                             }
                         all_results[report_type]["Sites"][tower]["Descriptions"].append(record["Description"])
                         all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                         all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                         all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
                         all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
-                        all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])
+                        all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])  # Default for local fallback
                         all_results[report_type]["Sites"][tower][discipline] += 1
                         all_results[report_type]["Sites"][tower]["Total"] += 1
-                        all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = \
-                            all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
+                        all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
                         all_results[report_type]["Grand_Total"] += 1
             except Exception as e:
-                logger.error(f"Exception during WatsonX call: {str(e)}")
-                st.error(f"❌ Exception during WatsonX call: {str(e)}")
+                error_msg = f"❌ Exception during WatsonX call: {str(e)}"
+                st.error(error_msg)
+                logger.error(error_msg)
+                st.write("Falling back to local count for this chunk")
                 for record in chunk:
-                    if (report_type == "Closed" and record.get("Days", 0) <= 21) or \
-                       (report_type == "Open" and record.get("Days_From_Today", 0) <= 21):
-                        logger.warning(f"Skipping invalid record in fallback: {record}")
-                        continue
                     tower = record["Tower"]
                     discipline = record["Discipline_Category"]
                     if tower not in all_results[report_type]["Sites"]:
                         all_results[report_type]["Sites"][tower] = {
-                            "Descriptions": [], "Created Date (WET)": [], "Expected Close Date (WET)": [],
-                            "Status": [], "Discipline": [], "Modules": [],
-                            "SW": 0, "FW": 0, "MEP": 0, "Total": 0, "ModulesCount": {}
+                            "Descriptions": [],
+                            "Created Date (WET)": [],
+                            "Expected Close Date (WET)": [],
+                            "Status": [],
+                            "Discipline": [],
+                            "Modules": [],
+                            "SW": 0,
+                            "FW": 0,
+                            "MEP": 0,
+                            "Total": 0,
+                            "ModulesCount": {}
                         }
+                        
                     all_results[report_type]["Sites"][tower]["Descriptions"].append(record["Description"])
                     all_results[report_type]["Sites"][tower]["Created Date (WET)"].append(record["Created Date (WET)"])
                     all_results[report_type]["Sites"][tower]["Expected Close Date (WET)"].append(record["Expected Close Date (WET)"])
                     all_results[report_type]["Sites"][tower]["Status"].append(record["Status"])
                     all_results[report_type]["Sites"][tower]["Discipline"].append(record["Discipline"])
-                    all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])
+                    all_results[report_type]["Sites"][tower]["Modules"].append(["Common"])  # Default for local fallback
                     all_results[report_type]["Sites"][tower][discipline] += 1
                     all_results[report_type]["Sites"][tower]["Total"] += 1
-                    all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = \
-                        all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
+                    all_results[report_type]["Sites"][tower]["ModulesCount"]["Common"] = all_results[report_type]["Sites"][tower]["ModulesCount"].get("Common", 0) + 1
                     all_results[report_type]["Grand_Total"] += 1
 
-        logger.info(f"Final {report_type} result: {json.dumps(all_results, indent=2)}")
+        st.write(f"Debug - Final {report_type} result: {json.dumps(all_results, indent=2)}")
         return all_results, json.dumps(all_results)
+        
 
 # Generate NCR Housekeeping Report
 @st.cache_data
@@ -2587,5 +2640,7 @@ if st.sidebar.button("All_Report", key="All_Report"):
     else:
         st.error("Please fetch data first!")
         
-             
-        
+
+
+
+
